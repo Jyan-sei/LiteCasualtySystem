@@ -141,6 +141,12 @@ namespace LiteEntitySystem.Internal
             {
                 int initialReaderPosition = bytesRead;
                 int totalSize = BitConverter.ToUInt16(Data, initialReaderPosition);
+                // a zero length record never advances the reader, and the null-entity cache resizes forever.
+                if (totalSize == 0)
+                {
+                    Logger.LogError("[CEM] Zero length diff record");
+                    return;
+                }
                 bytesRead += totalSize;
                 ushort entityId = BitConverter.ToUInt16(Data, initialReaderPosition + sizeof(ushort));
                 if (entityId == EntityManager.InvalidEntityId || entityId >= EntityManager.MaxSyncedEntityCount)

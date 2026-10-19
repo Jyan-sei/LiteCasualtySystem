@@ -149,6 +149,19 @@ namespace LiteEntitySystem
                 Container.EntityManager.EntityFieldChanged(Container, FieldId, ref value, ref oldValue, true);
         }
 
+        /// <summary>
+        /// Mark the current value dirty so the next diff includes it.
+        /// Writing the same value does not. Local OnSync is not called.
+        /// </summary>
+        public void MarkDirty()
+        {
+            if (Container == null || !Container.IsServer)
+                return;
+            T current = _value;
+            T same = _value;
+            Container.EntityManager.EntityFieldChanged(Container, FieldId, ref current, ref same, true);
+        }
+
         internal void Init(InternalEntity container, ushort fieldId)
         {
             Container = container;

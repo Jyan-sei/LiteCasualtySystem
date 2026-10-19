@@ -126,6 +126,10 @@ namespace LiteEntitySystem
         private readonly Queue<ServerStateData> _statesPool = new(MaxSavedStateDiff);
         private readonly Dictionary<ushort, ServerStateData> _receivedStates = new();
         private readonly SequenceBinaryHeap<ServerStateData> _readyStates = new(MaxSavedStateDiff);
+        private readonly List<ServerStateData> _catchUpPending = new();
+        private DateTime _catchUpLoggedAt;
+        private bool _catchUpMissed;
+        private const int CatchUpKeepReady = 2;
         private readonly Queue<PredictableEntityLogic> _tempLocalEntities = new ();
         private readonly byte[] _sendBuffer = new byte[NetConstants.MaxPacketSize];
         private readonly byte[] _zeroFieldBuffer = new byte[StateSerializer.MaxStateSize];
@@ -745,10 +749,89 @@ namespace LiteEntitySystem
         }
 
         /// <summary>
+        /// A hitch queues every server snapshot. Apply the extras in order here.
+        /// Prediction replay stays on the single blend into the newest one.
+        /// </summary>
+        private void CatchUpQueuedStates()
+        {
+            try
+            {
+                if (_readyStates.Count <= CatchUpKeepReady)
+                    return;
+
+                int count = _readyStates.Count;
+                _catchUpPending.Clear();
+                for (int i = 0; i < count; i++)
+                    _catchUpPending.Add(_readyStates.ExtractMin());
+
+                int applied = 0;
+                if (_stateB != null)
+                {
+                    CommitCaughtUpState(_stateB, false);
+                    applied++;
+                }
+
+                int last = _catchUpPending.Count - 1;
+                for (int i = 0; i < last; i++)
+                {
+                    ServerStateData state = _catchUpPending[i];
+                    if (state == null)
+                        continue;
+                    CommitCaughtUpState(state, true);
+                    applied++;
+                }
+
+                ServerStateData newest = last >= 0 ? _catchUpPending[last] : null;
+                if (newest != null)
+                {
+                    newest.Preload(EntitiesDict);
+                    _stateB = newest;
+                }
+
+                float step = DeltaTimeF > 0f ? DeltaTimeF : 1f / 30f;
+                _remoteInterpolationTotalTime = step;
+                _remoteInterpolationTimer = 0f;
+                _remoteLerpFactor = 0f;
+
+                if (applied > 0 && (DateTime.UtcNow - _catchUpLoggedAt).TotalSeconds > 2d)
+                {
+                    _catchUpLoggedAt = DateTime.UtcNow;
+                    Logger.Log($"state catch-up applied {applied}");
+                }
+            }
+            catch (Exception e)
+            {
+                if (_catchUpMissed)
+                    return;
+                _catchUpMissed = true;
+                Logger.LogWarning("state catch-up " + e.GetBaseException().Message);
+            }
+        }
+
+        private void CommitCaughtUpState(ServerStateData state, bool preload)
+        {
+            if (preload)
+                state.Preload(EntitiesDict);
+            ServerStateData prev = _stateA;
+            ushort prevTick = prev != null ? prev.Tick : (ushort)0;
+            if (prev != null && !ReferenceEquals(prev, state))
+                _statesPool.Enqueue(prev);
+            _stateA = state;
+            _stateB = null;
+            ServerTick = state.Tick;
+            _changedEntities.Clear();
+            state.ExecuteRpcs(prevTick, RPCExecuteMode.OnNextState);
+            ReadDiff();
+            ExecuteSyncCalls(state);
+        }
+
+        /// <summary>
         /// Update method, call this every frame
         /// </summary>
         public override void Update()
         {
+            CatchUpQueuedStates();
+
             //skip update until receive first sync and tickrate
             if (Tickrate == 0)
                 return;

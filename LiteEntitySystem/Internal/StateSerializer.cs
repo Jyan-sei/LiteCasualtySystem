@@ -300,7 +300,7 @@ namespace LiteEntitySystem.Internal
             _latestEntityData = null;
         }
 
-        public unsafe bool MakeDiff(NetPlayer player, ushort minimalTick, byte* resultData, ref int position)
+        public unsafe bool MakeDiff(NetPlayer player, ushort minimalTick, byte* resultData, ref int position, bool includeUnchanged = false)
         {
             if (_entity == null)
             {
@@ -308,8 +308,8 @@ namespace LiteEntitySystem.Internal
                 return false;
             }
             
-            //skip known
-            if (Utils.SequenceDiff(LastChangedTick, player.LatestServerTick) <= 0)
+            //skip known. the first baseline ignores this: a zero ack looks current after the tick wraps.
+            if (!includeUnchanged && Utils.SequenceDiff(LastChangedTick, player.LatestServerTick) <= 0)
                 return false;
             
             if (_entity.IsDestroyed && Utils.SequenceDiff(LastChangedTick, minimalTick) < 0)
@@ -356,8 +356,8 @@ namespace LiteEntitySystem.Internal
                     if (i % 8 == 0) //reset next byte each 8 bits
                         *++fields = 0;
                     
-                    //not actual
-                    if (Utils.SequenceDiff(_fieldChangeTicks[i].Tick, compareToTick) <= 0)
+                    //not actual. a full baseline still writes the current value.
+                    if (!includeUnchanged && Utils.SequenceDiff(_fieldChangeTicks[i].Tick, compareToTick) <= 0)
                     {
                         //Logger.Log($"SkipOld: {field.Name}");
                         //old data
