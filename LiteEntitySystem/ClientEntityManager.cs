@@ -796,7 +796,7 @@ namespace LiteEntitySystem
                 if (applied > 0 && (DateTime.UtcNow - _catchUpLoggedAt).TotalSeconds > 2d)
                 {
                     _catchUpLoggedAt = DateTime.UtcNow;
-                    Logger.Log($"state catch-up applied {applied}");
+                    //Logger.Log($"state catch-up applied {applied}");
                 }
             }
             catch (Exception e)

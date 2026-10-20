@@ -24,6 +24,9 @@
     </PropertyGroup>
 
     <PropertyGroup Condition=" '$(Configuration)' == 'Release' ">
+	  <Deterministic>False</Deterministic>
+	  <DebugType>none</DebugType>
+	  <Optimize>True</Optimize>
       <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
       <DocumentationFile>bin\Release\LiteEntitySystem.xml</DocumentationFile>
       <NoWarn>1591</NoWarn>
