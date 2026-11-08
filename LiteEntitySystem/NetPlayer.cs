@@ -51,7 +51,8 @@ namespace LiteEntitySystem
         
         //server only
         internal bool FirstBaselineSent;
-        internal NetPlayerState State;
+        /// <summary>Server replication state. Public so host mods can scope baselines by interest.</summary>
+        public NetPlayerState State { get; internal set; }
         internal readonly SequenceBinaryHeap<InputInfo> AvailableInput;
         internal readonly Dictionary<EntityLogic, SyncGroupData> EntitySyncInfo;
         internal DateTime ServerTickChangedTime;

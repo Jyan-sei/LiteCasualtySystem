@@ -92,6 +92,20 @@ namespace LiteEntitySystem
         /// Null sends every dirty entity.
         /// </summary>
         public Func<InternalEntity, NetPlayer, bool> ShouldSendEntityDiff;
+
+        /// <summary>
+        /// Interest / relevance filter for creates and baselines.
+        /// Return false to skip that entity for this player. Null replicates to everyone.
+        /// Partial diffs still use <see cref="ShouldSendEntityDiff"/>.
+        /// Per-RPC filtering uses <see cref="ShouldSendEntityRpc"/> when set.
+        /// </summary>
+        public Func<InternalEntity, NetPlayer, bool> ShouldReplicateEntityToPlayer;
+
+        /// <summary>
+        /// Optional per-RPC interest filter (rpcId is the LES remote-call id, including internal New/Construct/Destroy).
+        /// When null, <see cref="ShouldReplicateEntityToPlayer"/> is used for RPCs too.
+        /// </summary>
+        public Func<InternalEntity, NetPlayer, ushort, bool> ShouldSendEntityRpc;
         
         /// <summary>
         /// Rate at which server will make and send packets
@@ -240,6 +254,9 @@ namespace LiteEntitySystem
         public NetPlayer GetPlayer(byte ownerId) =>
             _netPlayers.TryGetValue(ownerId, out var p) ? p : null;
 
+        public NetPlayer GetPlayerByIndex(int index) =>
+            _netPlayers.GetByIndex(index);
+
         /// <summary>
         /// Ask for another full baseline on the next send.
         /// New and constructed calls are queued again, and every current field is included.
@@ -255,6 +272,28 @@ namespace LiteEntitySystem
                 _firstBaselineRequestedPlayers.Add(player);
             player.State = NetPlayerState.RequestBaseline;
             player.FirstBaselineSent = false;
+        }
+
+        /// <summary>
+        /// Queue New+Construct for one entity to one active player (interest stream-in).
+        /// No-op if the entity should not sync for that player.
+        /// </summary>
+        public void StreamEntityToPlayer(NetPlayer player, InternalEntity entity)
+        {
+            if (player == null || entity == null || entity.IsDestroyed || entity.IsRemoved)
+                return;
+            if (player.State == NetPlayerState.Removed || player.State == NetPlayerState.RequestBaseline)
+                return;
+            if (!_netPlayers.Contains(player.Id))
+                return;
+            ref var stateSerializer = ref _stateSerializers[entity.Id];
+            if (!stateSerializer.ShouldSync(player.Id, false))
+                return;
+            var newRpc = stateSerializer.MakeNewRPC(player);
+            if (newRpc != null)
+                stateSerializer.RefreshNewRPC(player, newRpc);
+            stateSerializer.MakeConstructedRPC(player);
+            _changedEntities.Add(entity);
         }
 
         /// <summary>
@@ -544,18 +583,20 @@ namespace LiteEntitySystem
                 ioBuffer));
             stateSerializer.Init(entity, _tick);
 
-            //create new rpc
+            // init first so interest filters can see position / owner
+            initMethod?.Invoke(entity);
+
+            //create new rpc only for players that should see this entity
             var tempList = _tempRpcListPool.Count > 0 ? _tempRpcListPool.Dequeue() : new();
             for(int i = 0; i < _netPlayers.Count; i++)
             {
                 var netPlayer = _netPlayers.GetByIndex(i);
+                if (ShouldReplicateEntityToPlayer != null && !ShouldReplicateEntityToPlayer(entity, netPlayer))
+                    continue;
                 var newRpc = stateSerializer.MakeNewRPC(netPlayer);
                 if(newRpc != null)
                     tempList.Add((netPlayer, newRpc));
             }
-            
-            //init and construct
-            initMethod?.Invoke(entity);
             
             //refresh with data set after init method
             for(int i = 0; i < tempList.Count; i++)
@@ -693,12 +734,13 @@ namespace LiteEntitySystem
                 //new rpcs at first
                 foreach (var e in GetEntities<InternalEntity>())
                 {
-                    if (_stateSerializers[e.Id].ShouldSync(player.Id, false))
-                    {
-                        var newRPC = _stateSerializers[e.Id].MakeNewRPC(player);
-                        _stateSerializers[e.Id].RefreshNewRPC(player, newRPC);
-                        _stateSerializers[e.Id].MakeConstructedRPC(player);
-                    }
+                    if (!_stateSerializers[e.Id].ShouldSync(player.Id, false))
+                        continue;
+                    if (ShouldReplicateEntityToPlayer != null && !ShouldReplicateEntityToPlayer(e, player))
+                        continue;
+                    var newRPC = _stateSerializers[e.Id].MakeNewRPC(player);
+                    _stateSerializers[e.Id].RefreshNewRPC(player, newRPC);
+                    _stateSerializers[e.Id].MakeConstructedRPC(player);
                 }
                 maxRpcSize = Math.Max(maxRpcSize, player.PendingRPCSize);
             }
@@ -743,7 +785,11 @@ namespace LiteEntitySystem
                     // later baselines stay ordinary diffs.
                     bool includeUnchanged = !player.FirstBaselineSent;
                     foreach (var e in GetEntities<InternalEntity>())
+                    {
+                        if (ShouldReplicateEntityToPlayer != null && !ShouldReplicateEntityToPlayer(e, player))
+                            continue;
                         _stateSerializers[e.Id].MakeDiff(player, _minimalTick, packetBuffer, ref originalLength, includeUnchanged);
+                    }
                     if (includeUnchanged)
                         Logger.Log($"[SEM] full baseline player {player.Id}");
                     player.FirstBaselineSent = true;
@@ -921,6 +967,16 @@ namespace LiteEntitySystem
                     return false;
 
                 var entity = EntitiesDict[rpcNode.Header.EntityId];
+                if (entity == null)
+                    return false;
+                // interest: skip RPCs for players that should not have this entity
+                if (ShouldSendEntityRpc != null)
+                {
+                    if (!ShouldSendEntityRpc(entity, player, rpcNode.Header.Id))
+                        return false;
+                }
+                else if (ShouldReplicateEntityToPlayer != null && !ShouldReplicateEntityToPlayer(entity, player))
+                    return false;
                 if (!rpcNode.AllowToSendForPlayer(player.Id, entity.InternalOwnerId.Value))
                     return false;
 
