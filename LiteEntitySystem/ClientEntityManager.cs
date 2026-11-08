@@ -1018,7 +1018,7 @@ namespace LiteEntitySystem
                 entity = AddEntity<InternalEntity>(new EntityParams(entityId, entityDataHeader, this, classData.AllocateDataCache()));
             }
             
-            ApplyEntityDelta(entity, rawData, readerPosition + StateSerializer.HeaderSize, true, true, firstSync);
+            ApplyEntityDelta(entity, rawData, readerPosition + StateSerializer.HeaderSize, true, true, firstSync, readerPosition + byteCount);
         }
         
         private void ExecuteSyncCalls(ServerStateData stateData)
@@ -1072,7 +1072,7 @@ namespace LiteEntitySystem
             }
 
             if(bytesCount > 0)
-                ApplyEntityDelta(entity, rawData, readerPosition, false, writeInterpolationData, false);
+                ApplyEntityDelta(entity, rawData, readerPosition, false, writeInterpolationData, false, readerPosition + bytesCount);
 
             //add owned entities to rollback queue
             if(!entity.IsConstructed && entity.InternalOwnerId.Value == InternalPlayerId)
@@ -1089,12 +1089,34 @@ namespace LiteEntitySystem
         private unsafe void ReadDiff()
         {
             int readerPosition = _stateA.DataOffset;
+            int dataEnd = _stateA.DataOffset + _stateA.DataSize;
+            if (_stateA.Data == null || dataEnd > _stateA.Data.Length)
+            {
+                Logger.LogError($"[CEM] Diff buffer bounds invalid. offset={_stateA.DataOffset} size={_stateA.DataSize} length={_stateA.Data?.Length ?? -1}");
+                return;
+            }
             fixed (byte* rawData = _stateA.Data)
             {
-                while (readerPosition < _stateA.DataOffset + _stateA.DataSize)
+                while (readerPosition < dataEnd)
                 {
+                    // Corrupt/truncated snapshots used to walk past the buffer here and hard-crash in unsafe code.
+                    if (readerPosition + StateSerializer.DiffHeaderSize > dataEnd)
+                    {
+                        Logger.LogError($"[CEM] Truncated diff header at {readerPosition}, end {dataEnd}");
+                        break;
+                    }
                     ushort totalSize = *(ushort*)(rawData + readerPosition);
+                    if (totalSize < StateSerializer.DiffHeaderSize)
+                    {
+                        Logger.LogError($"[CEM] Invalid diff record size: {totalSize} at {readerPosition}");
+                        break;
+                    }
                     int endPos = readerPosition + totalSize;
+                    if (endPos > dataEnd || endPos < readerPosition)
+                    {
+                        Logger.LogError($"[CEM] Diff record overruns buffer: size={totalSize} pos={readerPosition} end={dataEnd}");
+                        break;
+                    }
                     readerPosition += sizeof(ushort);
                     ushort entityId = *(ushort*)(rawData + readerPosition);
                     readerPosition += sizeof(ushort);
@@ -1107,7 +1129,7 @@ namespace LiteEntitySystem
                         continue;
                     }
                     
-                    ApplyEntityDelta(entity, rawData, readerPosition, false, false, false);
+                    ApplyEntityDelta(entity, rawData, readerPosition, false, false, false, endPos);
                     readerPosition = endPos;
                 }
             }
@@ -1119,9 +1141,15 @@ namespace LiteEntitySystem
             int fieldsFlagsOffset, 
             bool insideNewRPC,
             bool writeInterpolationData,
-            bool firstSync)
+            bool firstSync,
+            int dataEnd)
         {
             ref var classData = ref entity.ClassData;
+            if (fieldsFlagsOffset < 0 || fieldsFlagsOffset + classData.FieldsFlagsSize > dataEnd)
+            {
+                Logger.LogError($"[CEM] Truncated entity field flags. Entity: {entity}. flagsOffset={fieldsFlagsOffset} flagsSize={classData.FieldsFlagsSize} end={dataEnd}");
+                return;
+            }
             _changedEntities.Add(entity);
             Utils.ResizeOrCreate(ref _syncCalls, _syncCallsCount + classData.FieldsCount);
             int readerPosition = fieldsFlagsOffset + classData.FieldsFlagsSize;
@@ -1136,6 +1164,11 @@ namespace LiteEntitySystem
 
                     if(hasData)
                     {
+                        if (readerPosition + field.IntSize > dataEnd)
+                        {
+                            Logger.LogError($"[CEM] Truncated entity field data. Entity: {entity}. Field: {field.Name}. pos={readerPosition} size={field.IntSize} end={dataEnd}");
+                            return;
+                        }
                         fieldData = rawData + readerPosition;
                     }
                     else

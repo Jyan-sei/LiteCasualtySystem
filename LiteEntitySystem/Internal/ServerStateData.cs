@@ -109,12 +109,24 @@ namespace LiteEntitySystem.Internal
             var entityDict = _entityManager.EntitiesDict;
             var classDatas = _entityManager.ClassDataDict;
             
-            for (int bytesRead = _dataOffset; bytesRead < _dataOffset + _dataSize;)
+            int dataEnd = _dataOffset + _dataSize;
+            if (Data == null || dataEnd > Data.Length)
+                return;
+            for (int bytesRead = _dataOffset; bytesRead < dataEnd;)
             {
+                if (bytesRead + StateSerializer.DiffHeaderSize > dataEnd)
+                    break;
                 int initialReaderPosition = bytesRead;
                 int totalSize = BitConverter.ToUInt16(Data, initialReaderPosition);
-                bytesRead += totalSize;
+                if (totalSize < StateSerializer.DiffHeaderSize)
+                    break;
+                int endPos = bytesRead + totalSize;
+                if (endPos > dataEnd || endPos < bytesRead)
+                    break;
+                bytesRead = endPos;
                 ushort entityId = BitConverter.ToUInt16(Data, initialReaderPosition + sizeof(ushort));
+                if (entityId == EntityManager.InvalidEntityId || entityId >= EntityManager.MaxSyncedEntityCount)
+                    continue;
                 int classId = entityDict[entityId] != null 
                     ? entityDict[entityId].ClassId
                     : -1;
@@ -137,17 +149,34 @@ namespace LiteEntitySystem.Internal
         
         public void Preload(InternalEntity[] entityDict)
         {
-            for (int bytesRead = _dataOffset; bytesRead < _dataOffset + _dataSize;)
+            int dataEnd = _dataOffset + _dataSize;
+            if (Data == null || dataEnd > Data.Length)
             {
+                Logger.LogError($"[CEM] Diff buffer bounds invalid. offset={_dataOffset} size={_dataSize} length={Data?.Length ?? -1}");
+                return;
+            }
+            for (int bytesRead = _dataOffset; bytesRead < dataEnd;)
+            {
+                if (bytesRead + StateSerializer.DiffHeaderSize > dataEnd)
+                {
+                    Logger.LogError($"[CEM] Truncated diff header at {bytesRead}, end {dataEnd}");
+                    return;
+                }
                 int initialReaderPosition = bytesRead;
                 int totalSize = BitConverter.ToUInt16(Data, initialReaderPosition);
                 // a zero length record never advances the reader, and the null-entity cache resizes forever.
-                if (totalSize == 0)
+                if (totalSize < StateSerializer.DiffHeaderSize)
                 {
-                    Logger.LogError("[CEM] Zero length diff record");
+                    Logger.LogError($"[CEM] Invalid diff record size: {totalSize} at {initialReaderPosition}");
                     return;
                 }
-                bytesRead += totalSize;
+                int endPos = bytesRead + totalSize;
+                if (endPos > dataEnd || endPos < bytesRead)
+                {
+                    Logger.LogError($"[CEM] Diff record overruns buffer: size={totalSize} pos={initialReaderPosition} end={dataEnd}");
+                    return;
+                }
+                bytesRead = endPos;
                 ushort entityId = BitConverter.ToUInt16(Data, initialReaderPosition + sizeof(ushort));
                 if (entityId == EntityManager.InvalidEntityId || entityId >= EntityManager.MaxSyncedEntityCount)
                 {
@@ -165,11 +194,11 @@ namespace LiteEntitySystem.Internal
                     continue;
                 }
             
-                PreloadInterpolation(entity, initialReaderPosition);
+                PreloadInterpolation(entity, initialReaderPosition, endPos);
             }
         }
 
-        private unsafe void PreloadInterpolation(InternalEntity entity, int offset)
+        private unsafe void PreloadInterpolation(InternalEntity entity, int offset, int recordEnd)
         {
             if (!entity.IsRemoteControlled)
                 return;
@@ -179,6 +208,11 @@ namespace LiteEntitySystem.Internal
                 return;
             
             int entityFieldsOffset = offset + StateSerializer.DiffHeaderSize;
+            if (entityFieldsOffset + classData.FieldsFlagsSize > recordEnd)
+            {
+                Logger.LogError($"[CEM] Truncated interpolation field flags. Entity: {entity}. flagsOffset={entityFieldsOffset} flagsSize={classData.FieldsFlagsSize} end={recordEnd}");
+                return;
+            }
             int stateReaderOffset = entityFieldsOffset + classData.FieldsFlagsSize;
             
             //interpolated fields goes first so can skip some checks
@@ -189,6 +223,11 @@ namespace LiteEntitySystem.Internal
                     if (!Utils.IsBitSet(Data, entityFieldsOffset, i))
                         continue;
                     ref var field = ref classData.Fields[i];
+                    if (stateReaderOffset + field.IntSize > recordEnd)
+                    {
+                        Logger.LogError($"[CEM] Truncated interpolation field data. Entity: {entity}. Field: {field.Name}. pos={stateReaderOffset} size={field.IntSize} end={recordEnd}");
+                        return;
+                    }
                     var target = field.GetTargetObjectAndOffset(entity, out int fieldOffset);
                     field.TypeProcessor.SetInterpValue(target, fieldOffset, rawData + stateReaderOffset);
                     stateReaderOffset += field.IntSize;
@@ -198,6 +237,7 @@ namespace LiteEntitySystem.Internal
 
         public void PreloadInterpolationForNewEntities()
         {
+            int dataEnd = _dataOffset + _dataSize;
             for (int i = 0; i < _nullEntitiesCount; i++)
             {
                 var entity = _entityManager.EntitiesDict[_nullEntitiesData[i].EntityId];
@@ -205,8 +245,19 @@ namespace LiteEntitySystem.Internal
                     continue;
                 
                 //Logger.Log($"Read pending interpolation: {entity.Id}");
-                    
-                PreloadInterpolation(entity, _nullEntitiesData[i].Offset);
+                int offset = _nullEntitiesData[i].Offset;
+                int recordEnd = dataEnd;
+                if (Data != null && offset >= 0 && offset + sizeof(ushort) <= Data.Length)
+                {
+                    int totalSize = BitConverter.ToUInt16(Data, offset);
+                    if (totalSize >= StateSerializer.DiffHeaderSize)
+                    {
+                        int endPos = offset + totalSize;
+                        if (endPos <= dataEnd && endPos >= offset)
+                            recordEnd = endPos;
+                    }
+                }
+                PreloadInterpolation(entity, offset, recordEnd);
                     
                 //remove
                 _nullEntitiesCount--;
