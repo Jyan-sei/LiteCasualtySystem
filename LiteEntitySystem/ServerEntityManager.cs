@@ -81,22 +81,8 @@ namespace LiteEntitySystem
         public float PlayerResyncTimeout = 4.0f;
 
         /// <summary>
-        /// Called at the start of each logic tick, before input and the send.
-        /// </summary>
-        public Action BeforeLogicTick;
-
-        /// <summary>
-        /// Partial sync asks this before writing an entity diff.
-        /// Return false to skip that entity for this player on this tick. It stays dirty and is visited again.
-        /// Full baselines ignore it, and so does any player that is not <see cref="NetPlayerState.Active"/>.
-        /// Null sends every dirty entity.
-        /// </summary>
-        public Func<InternalEntity, NetPlayer, bool> ShouldSendEntityDiff;
-
-        /// <summary>
         /// Interest / relevance filter for creates and baselines.
         /// Return false to skip that entity for this player. Null replicates to everyone.
-        /// Partial diffs still use <see cref="ShouldSendEntityDiff"/>.
         /// Per-RPC filtering uses <see cref="ShouldSendEntityRpc"/> when set.
         /// </summary>
         public Func<InternalEntity, NetPlayer, bool> ShouldReplicateEntityToPlayer;
@@ -256,23 +242,6 @@ namespace LiteEntitySystem
 
         public NetPlayer GetPlayerByIndex(int index) =>
             _netPlayers.GetByIndex(index);
-
-        /// <summary>
-        /// Ask for another full baseline on the next send.
-        /// New and constructed calls are queued again, and every current field is included.
-        /// An object the player already has is updated. A missing one is created.
-        /// </summary>
-        public void RequestFullBaseline(NetPlayer player)
-        {
-            if (player == null || player.State == NetPlayerState.Removed)
-                return;
-            if (!_netPlayers.Contains(player.Id))
-                return;
-            if (!_firstBaselineRequestedPlayers.Contains(player))
-                _firstBaselineRequestedPlayers.Add(player);
-            player.State = NetPlayerState.RequestBaseline;
-            player.FirstBaselineSent = false;
-        }
 
         /// <summary>
         /// Queue New+Construct for one entity to one active player (interest stream-in).
@@ -625,17 +594,10 @@ namespace LiteEntitySystem
                 RemoveEntity(e);
             else
                 _stateSerializers[e.Id].MakeDestroyedRPC(_tick);
-
-            // a destroy that already left the changed set never reached clients.
-            // put it back. it is freed later, once every player has this tick.
-            if (e.IsDestroyed && !e.IsRemoved)
-                _changedEntities.Add(e);
         }
 
         protected override unsafe void OnLogicTick()
         {
-            BeforeLogicTick?.Invoke();
-
             //read pending client requests
             while (_pendingClientRequests.Count > 0)
             {
@@ -780,19 +742,19 @@ namespace LiteEntitySystem
                             
                     rpcSize = originalLength;  
 
-                    // the first packet to this player includes every current field.
-                    // a zero ack used to look already current once the server tick had wrapped.
-                    // later baselines stay ordinary diffs.
-                    bool includeUnchanged = !player.FirstBaselineSent;
-                    foreach (var e in GetEntities<InternalEntity>())
+                    if(player.FirstBaselineSent)
                     {
-                        if (ShouldReplicateEntityToPlayer != null && !ShouldReplicateEntityToPlayer(e, player))
-                            continue;
-                        _stateSerializers[e.Id].MakeDiff(player, _minimalTick, packetBuffer, ref originalLength, includeUnchanged);
+                        foreach (var e in GetEntities<InternalEntity>())
+                        {
+                            if (ShouldReplicateEntityToPlayer != null && !ShouldReplicateEntityToPlayer(e, player))
+                                continue;
+                            _stateSerializers[e.Id].MakeDiff(player, _minimalTick, packetBuffer, ref originalLength);
+                        }
                     }
-                    if (includeUnchanged)
-                        Logger.Log($"[SEM] full baseline player {player.Id}");
-                    player.FirstBaselineSent = true;
+                    else
+                    {
+                        player.FirstBaselineSent = true;
+                    }
                     
                     //set header
                     *(BaselineDataHeader*)compressionBuffer = new BaselineDataHeader
@@ -895,10 +857,6 @@ namespace LiteEntitySystem
                         }
                         continue;
                     }
-
-                    // this loop only runs for Active players. a joiner still on a baseline is handled above.
-                    if (ShouldSendEntityDiff != null && !ShouldSendEntityDiff(entity, player))
-                        continue;
 
                     if (stateSerializer.MakeDiff(player, _minimalTick, packetBuffer, ref writePosition))
                     {
